@@ -1,0 +1,231 @@
+diff --git a/data_handler.py b/data_handler.py
+index e7e4eba..5974c28 100644
+--- a/data_handler.py
++++ b/data_handler.py
+@@ -1,9 +1,19 @@
+ import pickle
++import time
+ import numpy as np
+ from scipy.sparse import csr_matrix, coo_matrix, dok_matrix
+ from params import args
+ import scipy.sparse as sp
+ from Utils.TimeLogger import log
++
++
++def symmetrize_train_csr(csr_mat):
++    """Binary CSR with (u, v) iff train has u->v or v->u (wander eval mask)."""
++    rev = csr_mat.transpose().tocsr()
++    sym = (csr_mat + rev).astype(np.float32)
++    sym.data = np.ones_like(sym.data, dtype=np.float32)
++    sym.eliminate_zeros()
++    return sym
+ import torch as t
+ import torch.utils.data as data
+ import torch_geometric.transforms as T
+@@ -55,7 +65,11 @@ class DataHandler:
+         self.load_data()
+     
+     def get_data_files(self):
+-        predir = f'/home/user_name/data/zero-shot datasets/{self.data_name}/'
++        _data_root = os.environ.get(
++            'ANYGRAPH_DATA_ROOT',
++            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zero-shot datasets'),
++        )
++        predir = os.path.join(_data_root, self.data_name) + os.sep
+         if os.path.exists(predir + 'feats.pkl'):
+             self.feat_file = predir + 'feats.pkl'
+         else:
+@@ -238,16 +252,42 @@ class DataHandler:
+ class TstData(data.Dataset):
+     def __init__(self, coomat, trn_mat):
+         self.csrmat = (trn_mat.tocsr() != 0) * 1.0
++        self.is_homogeneous = coomat.shape[0] == coomat.shape[1]
++        self.symmetrize_train_mask = bool(
++            args.eval_protocol_wander and self.is_homogeneous
++        )
++        trn_pairs = set(
++            zip(trn_mat.row.tolist(), trn_mat.col.tolist())
++        ) if self.symmetrize_train_mask else None
+         tstLocs = [None] * coomat.shape[0]
+         tst_nodes = set()
++        n_raw = len(coomat.data)
++        n_kept = 0
+         for i in range(len(coomat.data)):
+-            row = coomat.row[i]
+-            col = coomat.col[i]
++            row = int(coomat.row[i])
++            col = int(coomat.col[i])
++            if trn_pairs is not None:
++                if (row, col) in trn_pairs or (col, row) in trn_pairs:
++                    continue
+             if tstLocs[row] is None:
+                 tstLocs[row] = list()
+             tstLocs[row].append(col)
+             tst_nodes.add(row)
+-        tst_nodes = np.array(list(tst_nodes))
++            n_kept += 1
++        self.csrmat_sym = None
++        if self.symmetrize_train_mask:
++            log(
++                f'eval_protocol_wander: {n_kept}/{n_raw} eval queries, '
++                f'{len(tst_nodes)} source nodes (homogeneous)'
++            )
++            log('Precomputing symmetrized train CSR for wander eval...')
++            t0 = time.time()
++            self.csrmat_sym = symmetrize_train_csr(self.csrmat)
++            log(
++                f'symmetrized train CSR: nnz={self.csrmat_sym.nnz} '
++                f'({time.time() - t0:.1f}s)'
++            )
++        tst_nodes = np.array(sorted(tst_nodes))
+         self.tst_nodes = tst_nodes
+         self.tstLocs = tstLocs
+ 
+diff --git a/main.py b/main.py
+index 30159cd..13509fa 100644
+--- a/main.py
++++ b/main.py
+@@ -187,9 +187,11 @@ class Exp:
+         return ret
+     
+     def make_trn_masks(self, numpy_usrs, csr_mat):
++        cand_size = csr_mat.shape[1]
+         trn_masks = csr_mat[numpy_usrs].tocoo()
+-        cand_size = trn_masks.shape[1]
+-        trn_masks = t.from_numpy(np.stack([trn_masks.row, trn_masks.col], axis=0)).long()
++        trn_masks = t.from_numpy(
++            np.stack([trn_masks.row, trn_masks.col], axis=0)
++        ).long()
+         return trn_masks, cand_size
+ 
+     def test_epoch(self, handler, dataset_id):
+@@ -205,7 +207,15 @@ class Exp:
+                     break
+ 
+                 usrs = batch_data.long()
+-                trn_masks, cand_size = self.make_trn_masks(batch_data.numpy(), tst_loader.dataset.csrmat)
++                mask_csr = tst_loader.dataset.csrmat
++                sym_csr = getattr(tst_loader.dataset, 'csrmat_sym', None)
++                if getattr(tst_loader.dataset, 'symmetrize_train_mask', False):
++                    assert sym_csr is not None
++                    mask_csr = sym_csr
++                trn_masks, cand_size = self.make_trn_masks(
++                    batch_data.numpy(),
++                    mask_csr,
++                )
+                 feats = handler.projectors
+                 all_preds = expert.pred_for_test((usrs, trn_masks), cand_size, feats, rerun_embed=False if i!=0 else True)
+                 _, top_locs = t.topk(all_preds, args.topk)
+@@ -275,6 +285,8 @@ if __name__ == '__main__':
+     setproctitle.setproctitle('AnyGraph')
+ 
+     log('Start')
++    if args.eval_protocol_wander:
++        log('eval_protocol_wander enabled (paper-protocol homogeneous Recall@K eval)')
+ 
+     
+     datasets = dict()
+diff --git a/node_classification/data_handler.py b/node_classification/data_handler.py
+index 3b57225..c065c1e 100644
+--- a/node_classification/data_handler.py
++++ b/node_classification/data_handler.py
+@@ -10,6 +10,31 @@ import torch_geometric.transforms as T
+ from model import Feat_Projector, Adj_Projector, TopoEncoder
+ import os
+ 
++
++class _NumpyCompatUnpickler(pickle.Unpickler):
++    """Load NumPy 2.x pickles in AnyGraph's NumPy 1.x environment."""
++
++    def find_class(self, module, name):
++        if module.startswith("numpy._core"):
++            module = module.replace("numpy._core", "numpy.core")
++        return super().find_class(module, name)
++
++
++def _compat_pickle_load(fh):
++    try:
++        obj = pickle.load(fh)
++    except ModuleNotFoundError:
++        fh.seek(0)
++        obj = _NumpyCompatUnpickler(fh).load()
++    if isinstance(obj, dict) and obj.get("__wander_coo__"):
++        row = np.frombuffer(obj["row"], dtype=np.int64)
++        col = np.frombuffer(obj["col"], dtype=np.int64)
++        data = np.frombuffer(obj["data"], dtype=np.float32)
++        return coo_matrix((data, (row, col)), shape=tuple(obj["shape"]))
++    if isinstance(obj, dict) and obj.get("__wander_ndarray__"):
++        return np.frombuffer(obj["bytes"], dtype=np.float32).reshape(obj["shape"]).copy()
++    return obj
++
+ class MultiDataHandler:
+     def __init__(self, trn_datasets, tst_datasets_group):
+         all_datasets = trn_datasets
+@@ -55,8 +80,11 @@ class DataHandler:
+         self.load_data()
+     
+     def get_data_files(self):
+-        predir = f'/home/user_name/data/zero-shot datasets/node_data/{self.data_name}/'
+-        # predir = f'../handle_node_data/{self.data_name}/'
++        _data_root = os.environ.get(
++            'ANYGRAPH_DATA_ROOT',
++            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'zero-shot datasets'),
++        )
++        predir = os.path.join(_data_root, 'node_data', self.data_name) + os.sep
+         if os.path.exists(predir + 'feats.pkl'):
+             self.feat_file = predir + 'feats.pkl'
+         else:
+@@ -68,7 +96,7 @@ class DataHandler:
+ 
+     def load_one_file(self, filename):
+         with open(filename, 'rb') as fs:
+-            ret = (pickle.load(fs) != 0).astype(np.float32)
++            ret = (_compat_pickle_load(fs) != 0).astype(np.float32)
+         if type(ret) != coo_matrix:
+             ret = sp.coo_matrix(ret)
+         return ret
+@@ -76,7 +104,7 @@ class DataHandler:
+     def load_feats(self, filename):
+         try:
+             with open(filename, 'rb') as fs:
+-                feats = pickle.load(fs)
++                feats = _compat_pickle_load(fs)
+         except Exception as e:
+             print(filename + str(e))
+             exit()
+diff --git a/node_classification/main.py b/node_classification/main.py
+index fd60cc2..f2b5f87 100644
+--- a/node_classification/main.py
++++ b/node_classification/main.py
+@@ -355,6 +355,9 @@ if __name__ == '__main__':
+             if data in tst_datasets_2:
+                 tst_datasets.append(data)
+         trn_datasets = tst_datasets
++    else:
++        # Single custom dataset (Wander NC slugs under node_data/<name>/).
++        trn_datasets = tst_datasets = [args.dataset_setting]
+ 
+     # trn_datasets = tst_datasets = ['products_home']
+     if '+' not in args.dataset_setting:
+diff --git a/params.py b/params.py
+index b5625ac..e976c5f 100644
+--- a/params.py
++++ b/params.py
+@@ -39,5 +39,16 @@ def parse_args():
+     parser.add_argument('--nn', default='mlp', type=str, help='what trainable network to use')
+     parser.add_argument('--proj_trn_steps', default=100, type=int, help='number of training steps for one initial projection')
+     parser.add_argument('--attempt_cache', default=10000000, type=int, help='number of training steps for one initial projection')
++    parser.add_argument(
++        '--eval_protocol_wander',
++        action='store_true',
++        default=False,
++        help=(
++            'Use Wander-style Recall@K eval on homogeneous graphs: drop '
++            'val/test queries whose reverse is in train, and symmetrize train-positive '
++            'filtering (mask both outgoing and incoming train neighbors). Bipartite '
++            'datasets are unchanged.'
++        ),
++    )
+     return parser.parse_args()
+ args = parse_args()
+\ No newline at end of file

@@ -1,0 +1,7 @@
+# Pinned upstream checkouts for baseline / prior-ablation code.
+# Used by scripts/setup_third_party.sh. Fields: name<TAB>url<TAB>sha
+graphpfn	https://github.com/yandex-research/graphpfn.git	c5590857828a33e22f4de949e3b635cca44064d8
+NodePFN	https://github.com/jeongwhanchoi/NodePFN.git	99720f19a6321a00933f59c22bd482090abe96f9
+AnyGraph	https://github.com/HKUDS/AnyGraph.git	c2c5bfe103c453f03498568c0886a1ffecbd2a52
+GraphAny	https://github.com/DeepGraphLearning/GraphAny.git	403991de68037476dfa0db277efdc7724cb9c775
+context_LP	https://github.com/Barcavin/context_LP.git	45fce99d0041025376ba4bb3add601e63b048742

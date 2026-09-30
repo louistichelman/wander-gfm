@@ -1,0 +1,604 @@
+diff --git a/bin/g2t/g2t_fm.py b/bin/g2t/g2t_fm.py
+index d44102f..969f019 100644
+--- a/bin/g2t/g2t_fm.py
++++ b/bin/g2t/g2t_fm.py
+@@ -86,6 +86,7 @@ class Config(TypedDict):
+     ]
+     finetune_layers: NotRequired[int]
+     randperm: NotRequired[bool]
++    drop_feature_indices: NotRequired[list[int]]
+ 
+ 
+ class G2T(nn.Module):
+@@ -381,17 +382,28 @@ def main(
+     dataset = dataset.to_torch(device)
+ 
+     train_mask = dataset.data["masks"]["train"]
++    drop_feature_indices = set(config.get("drop_feature_indices", []))
+     feature_groups: list[Tensor] = []
+-    for source in feature_sources:
++    for source_idx, source in enumerate(feature_sources):
+         group_np = lib.graph.data.flatten_features(source)
+         if group_np is None:
+             continue
++        if drop_feature_indices and source_idx == 0:
++            keep = [
++                col
++                for col in range(group_np.shape[1])
++                if col not in drop_feature_indices
++            ]
++            group_np = group_np[:, keep]
+         group = torch.tensor(group_np, device=device)
+         group = lib.graph.data.drop_constant_features(group, train_mask)  # type: ignore
+         if group.shape[1] == 0:
+             continue
+         feature_groups.append(group)
+ 
++    if drop_feature_indices:
++        report["drop_feature_indices"] = sorted(drop_feature_indices)
++
+     y_train = dataset.data["labels"][dataset.data["masks"]["train"]].to(  # type: ignore
+         dtype=torch.float32, device=device
+     )
+diff --git a/bin/go.py b/bin/go.py
+index 5cf603e..9d14d9e 100755
+--- a/bin/go.py
++++ b/bin/go.py
+@@ -57,8 +57,17 @@ def main(
+             evaluation_config["base_config"].pop("seed", None)
+             lib.dump_config(evaluation_config_path, evaluation_config, force=force)  # type: ignore
+ 
++        bin.evaluate.main(evaluation_config_path, continue_=continue_, force=force)
++
+     elif config.name == "evaluation.toml":
+-        evaluation_config_path = config
++        evaluation_config = lib.load_config(config)
++        evaluation_config["n_seeds"] = n_seeds
++        bin.evaluate.main(
++            evaluation_config,
++            output=config.with_suffix(""),
++            continue_=continue_,
++            force=force,
++        )
+ 
+     elif config.name == "pretrain.toml":
+         pretrain_config = lib.load_config(config)
+@@ -71,16 +80,13 @@ def main(
+             output=config.with_suffix(""),
+             profiler=profiler,
+         )
+-        return
+ 
+     else:
+         raise ValueError(
+             'The config name must be either "tuning.toml", "evaluation.toml"'
+-            f' or "evaluation.toml". However: {config.name=}'
++            f' or "pretrain.toml". However: {config.name=}'
+         )
+ 
+-    bin.evaluate.main(evaluation_config_path, continue_=continue_, force=force)
+-
+ 
+ if __name__ == "__main__":
+     lib.init()
+diff --git a/bin/graphpfn/evaluate.py b/bin/graphpfn/evaluate.py
+index 47accea..fb2172d 100644
+--- a/bin/graphpfn/evaluate.py
++++ b/bin/graphpfn/evaluate.py
+@@ -59,6 +59,7 @@ class Config(TypedDict):
+     min_train_ratio: float
+ 
+     ensemble: EnsembleConfig
++    drop_feature_indices: NotRequired[list[int]]
+ 
+ 
+ class CandidateQueue:
+@@ -324,6 +325,13 @@ def main(
+     dataset = dataset.to_torch(device)
+     features = lib.graph.data.flatten_features(dataset.features)
+     assert features is not None
++    drop_feature_indices = set(config.get("drop_feature_indices", []))
++    if drop_feature_indices:
++        keep = [
++            col for col in range(features.shape[1]) if col not in drop_feature_indices
++        ]
++        features = features[:, keep]
++        report["drop_feature_indices"] = sorted(drop_feature_indices)
+     features = lib.graph.data.drop_constant_features(
+         features,
+         dataset.data["masks"]["train"],  # type: ignore
+@@ -522,6 +530,7 @@ def main(
+     if config["seed"] > 0:
+         lib.get_checkpoint_path(output).unlink()
+ 
++    report["metric"] = dataset.task.score.value
+     report["time"] = timer.elapsed()
+     lib.finish(output, report)
+     return report
+diff --git a/lib/graph/constants.py b/lib/graph/constants.py
+index d163eea..3441809 100644
+--- a/lib/graph/constants.py
++++ b/lib/graph/constants.py
+@@ -35,6 +35,17 @@ PYG_DATASETS = [
+     "facebook",
+     "flickr",
+     "wiki-cs",
++    "actor",
++    "chameleon",
++    "squirrel",
++    "cornell",
++    "texas",
++    "wisconsin",
++    "brazil",
++    "europe",
++    "usa",
++    "full-cora",
++    "full-dblp",
+ ]
+ 
+ OGB_DATASETS = [
+@@ -44,6 +55,71 @@ OGB_DATASETS = [
+ 
+ OTHER_DATASETS = [
+     "amazon-ratings-full",
++    "amazon-fraud",
++    "yelpchi",
++    "yelpchi-rel0",
++    "yelpchi-rel1",
++    "yelpchi-rel2",
++    "acm",
++    "imdb",
++    "dblp-mgb",
++    "amazon7621",
++    "freebase",
++    "motif-triangle",
++    "motif-c4",
++    "motif-c5",
++    "motif-mixed",
++    "pokec-regions-100k-top10",
++    "pokec-regions-100k-top10-nofeat",
++    "squirrel-filtered",
++    "chameleon-filtered",
++    "coauthor-cs-nofeat",
++    "coauthor-physics-nofeat",
++    "amazon-computers-nofeat",
++    "full-dblp-nofeat",
++    "amazon-photo-nofeat",
++    "pubmed-nofeat",
++    "yelpchi-nofeat",
++    "yelpchi-rel0-nofeat",
++    "yelpchi-rel1-nofeat",
++    "yelpchi-rel2-nofeat",
++    "motif-triangle-nofeat",
++    "motif-c4-nofeat",
++    "motif-c5-nofeat",
++    "motif-mixed-nofeat",
++    "actor-nofeat",
++    "amazon-ratings-nofeat",
++    "artnet-exp-nofeat",
++    "brazil-nofeat",
++    "chameleon-nofeat",
++    "citeseer-nofeat",
++    "city-reviews-nofeat",
++    "cora-nofeat",
++    "cornell-nofeat",
++    "europe-nofeat",
++    "full-cora-nofeat",
++    "hm-categories-nofeat",
++    "minesweeper-nofeat",
++    "pokec-regions-nofeat",
++    "questions-nofeat",
++    "roman-empire-nofeat",
++    "squirrel-nofeat",
++    "squirrel-filtered-nofeat",
++    "chameleon-filtered-nofeat",
++    "texas-nofeat",
++    "tolokers-nofeat",
++    "tolokers-2-nofeat",
++    "usa-nofeat",
++    "amazon-fraud-nofeat",
++    "acm-nofeat",
++    "imdb-nofeat",
++    "dblp-mgb-nofeat",
++    "amazon7621-nofeat",
++    "freebase-nofeat",
++    "wiki-cs-nofeat",
++    "wisconsin-nofeat",
++    "cycles",
++    "grids",
+ ]
+ 
+ DATASETS = [
+@@ -77,6 +153,60 @@ MULTICLASS_DATASETS = [
+     "pokec-regions",
+     "web-topics",
+     "amazon-ratings-full",
++    "actor",
++    "chameleon",
++    "chameleon-filtered",
++    "squirrel",
++    "squirrel-filtered",
++    "cornell",
++    "texas",
++    "wisconsin",
++    "brazil",
++    "europe",
++    "usa",
++    "full-cora",
++    "full-dblp",
++    "acm",
++    "imdb",
++    "dblp-mgb",
++    "amazon7621",
++    "freebase",
++    "motif-mixed",
++    "motif-mixed-nofeat",
++    "pokec-regions-100k-top10",
++    "pokec-regions-100k-top10-nofeat",
++    "coauthor-cs-nofeat",
++    "coauthor-physics-nofeat",
++    "amazon-computers-nofeat",
++    "full-dblp-nofeat",
++    "amazon-photo-nofeat",
++    "pubmed-nofeat",
++    "actor-nofeat",
++    "amazon-ratings-nofeat",
++    "brazil-nofeat",
++    "chameleon-nofeat",
++    "citeseer-nofeat",
++    "cora-nofeat",
++    "cornell-nofeat",
++    "europe-nofeat",
++    "full-cora-nofeat",
++    "hm-categories-nofeat",
++    "pokec-regions-nofeat",
++    "roman-empire-nofeat",
++    "squirrel-nofeat",
++    "squirrel-filtered-nofeat",
++    "chameleon-filtered-nofeat",
++    "texas-nofeat",
++    "usa-nofeat",
++    "acm-nofeat",
++    "imdb-nofeat",
++    "dblp-mgb-nofeat",
++    "amazon7621-nofeat",
++    "freebase-nofeat",
++    "wiki-cs-nofeat",
++    "wisconsin-nofeat",
++    "cycles",
++    "grids",
+ ]
+ 
+ BINCLASS_DATASETS = [
+@@ -87,6 +217,28 @@ BINCLASS_DATASETS = [
+     "city-reviews",
+     "artnet-exp",
+     "web-fraud",
++    "amazon-fraud",
++    "yelpchi",
++    "yelpchi-rel0",
++    "yelpchi-rel1",
++    "yelpchi-rel2",
++    "motif-triangle",
++    "motif-c4",
++    "motif-c5",
++    "yelpchi-nofeat",
++    "yelpchi-rel0-nofeat",
++    "yelpchi-rel1-nofeat",
++    "yelpchi-rel2-nofeat",
++    "motif-triangle-nofeat",
++    "motif-c4-nofeat",
++    "motif-c5-nofeat",
++    "artnet-exp-nofeat",
++    "city-reviews-nofeat",
++    "minesweeper-nofeat",
++    "questions-nofeat",
++    "tolokers-nofeat",
++    "tolokers-2-nofeat",
++    "amazon-fraud-nofeat",
+ ]
+ 
+ REGRESSION_DATASETS = [
+@@ -121,6 +273,12 @@ PREDEFINED_SPLIT_DATASETS = [
+     *HETEROPHILOUS_DATASETS,
+     *GRAPHLAND_DATASETS,
+     *OTHER_DATASETS,
++    "actor",
++    "chameleon",
++    "squirrel",
++    "cornell",
++    "texas",
++    "wisconsin",
+ ]
+ 
+ HOMOGENEOUS_DATASETS = [
+diff --git a/lib/graph/data.py b/lib/graph/data.py
+index d5c8734..946532c 100644
+--- a/lib/graph/data.py
++++ b/lib/graph/data.py
+@@ -62,6 +62,88 @@ class GraphData(TypedDict):
+ 
+ GRAPH_FEATURE_KEYS = [f"{key}_features" for key in ["num", "frac", "cat"]]
+ 
++PYG_NAME_ALIASES: dict[str, str] = {
++    "roman-empire": "Roman-empire",
++    "amazon-ratings": "Amazon-ratings",
++    "minesweeper": "Minesweeper",
++    "tolokers": "Tolokers",
++    "questions": "Questions",
++    "cora": "Cora",
++    "citeseer": "CiteSeer",
++    "pubmed": "PubMed",
++    "actor": "Actor",
++    "chameleon": "chameleon",
++    "squirrel": "squirrel",
++    "cornell": "Cornell",
++    "texas": "Texas",
++    "wisconsin": "Wisconsin",
++    "brazil": "Brazil",
++    "europe": "Europe",
++    "usa": "USA",
++    "full-cora": "Cora",
++    "full-dblp": "DBLP",
++}
++
++
++def _load_pyg_dataset(name: str, root: str):
++    pyg_name = PYG_NAME_ALIASES.get(name, name)
++
++    if name in [
++        "roman-empire",
++        "amazon-ratings",
++        "minesweeper",
++        "tolokers",
++        "questions",
++    ]:
++        return pyg_datasets.HeterophilousGraphDataset(name=pyg_name, root=root)
++
++    if name in ["cora", "citeseer", "pubmed"]:
++        return pyg_datasets.Planetoid(name=pyg_name, root=root)
++
++    if name in ["coauthor-cs", "coauthor-physics"]:
++        coauthor_name = "CS" if name == "coauthor-cs" else "Physics"
++        return pyg_datasets.Coauthor(name=coauthor_name, root=root)
++
++    if name in ["amazon-computers", "amazon-photo"]:
++        amazon_name = "Computers" if name == "amazon-computers" else "Photo"
++        return pyg_datasets.Amazon(name=amazon_name, root=root)
++
++    if name == "lastfm-asia":
++        return pyg_datasets.LastFMAsia(root=root)
++
++    if name == "facebook":
++        return pyg_datasets.FacebookPagePage(root=root)
++
++    if name == "flickr":
++        return pyg_datasets.Flickr(root=root)
++
++    if name == "wiki-cs":
++        return pyg_datasets.WikiCS(root=root)
++
++    if name == "actor":
++        return pyg_datasets.Actor(root=root)
++
++    if name in ["chameleon", "squirrel"]:
++        return pyg_datasets.WikipediaNetwork(
++            root=root,
++            name=pyg_name,
++            geom_gcn_preprocess=True,
++        )
++
++    if name in ["cornell", "texas", "wisconsin"]:
++        return pyg_datasets.WebKB(root=root, name=pyg_name)
++
++    if name in ["brazil", "europe", "usa"]:
++        return pyg_datasets.Airports(root=root, name=pyg_name)
++
++    if name == "full-cora":
++        return pyg_datasets.CitationFull(root=root, name="Cora")
++
++    if name == "full-dblp":
++        return pyg_datasets.CitationFull(root=root, name="DBLP")
++
++    raise ValueError(f"Unknown dataset {name=}!")
++
+ 
+ def _load_graphland_data(
+     path: str | Path,
+@@ -70,8 +152,9 @@ def _load_graphland_data(
+     **kwargs,
+ ) -> GraphData:
+     del kwargs
+-    path = Path(path).resolve()
+-    name = path.name
++    path_in = Path(path)
++    name = path_in.name
++    path = path_in.resolve()
+ 
+     if name not in constants.GRAPHLAND_DATASETS:
+         raise ValueError(f"Unknown dataset {name=}!")
+@@ -174,42 +257,12 @@ def _load_pyg_data(
+         "Specifying internal_split_index exludes external_split_file."
+     )
+ 
+-    path = Path(path).resolve()
+-    name = path.name
++    path_in = Path(path)
++    name = path_in.name
++    path = path_in.resolve()
+     root = str(path)
+ 
+-    if name in [
+-        "roman-empire",
+-        "amazon-ratings",
+-        "minesweeper",
+-        "tolokers",
+-        "questions",
+-    ]:
+-        dataset = pyg_datasets.HeterophilousGraphDataset(name=name, root=root)
+-
+-    elif name in ["cora", "citeseer", "pubmed"]:
+-        dataset = pyg_datasets.Planetoid(name=name, root=root)
+-
+-    elif name in ["coauthor-cs", "coauthor-physics"]:
+-        dataset = pyg_datasets.Coauthor(name=name.split("-")[1], root=root)
+-
+-    elif name in ["amazon-computers", "amazon-photo"]:
+-        dataset = pyg_datasets.Amazon(name=name.split("-")[1], root=root)
+-
+-    elif name == "lastfm-asia":
+-        dataset = pyg_datasets.LastFMAsia(root=root)
+-
+-    elif name == "facebook":
+-        dataset = pyg_datasets.FacebookPagePage(root=root)
+-
+-    elif name == "flickr":
+-        dataset = pyg_datasets.Flickr(root=root)
+-
+-    elif name == "wiki-cs":
+-        dataset = pyg_datasets.WikiCS(root=root)
+-
+-    else:
+-        raise ValueError(f"Unknown dataset {name=}!")
++    dataset = _load_pyg_dataset(name, root)
+ 
+     data: PygData = dataset[0]  # type: ignore
+ 
+@@ -298,8 +351,9 @@ def _load_ogb_data(
+         "No external splits are available for OGB datasets!"
+     )
+ 
+-    path = Path(path).resolve()
+-    name = path.name
++    path_in = Path(path)
++    name = path_in.name
++    path = path_in.resolve()
+     root = str(path)
+ 
+     if name not in constants.OGB_DATASETS:
+@@ -343,17 +397,23 @@ def _load_ogb_data(
+ def _load_other_data(
+     path: str | Path,
+     *,
+-    internal_split_name: Literal["RL", "RH", "TH"],
++    internal_split_name: None | Literal["RL", "RH", "TH"] = None,
++    external_split_file: None | str = None,
+     **kwargs,
+ ) -> GraphData:
+     del kwargs
+ 
+-    path = Path(path).resolve()
+-    name = path.name
++    path_in = Path(path)
++    name = path_in.name
++    path = path_in.resolve()
+ 
+-    if path.name not in constants.OTHER_DATASETS:
++    if name not in constants.OTHER_DATASETS and name not in constants.OGB_DATASETS:
+         raise ValueError(f"Unknown dataset {name=}!")
+ 
++    assert (external_split_file is not None) ^ (internal_split_name is not None), (
++        "Specify exactly one of external_split_file or internal_split_name."
++    )
++
+     features: np.ndarray = np.load(path / "features.npy", allow_pickle=True)
+     num_features = features.astype(np.float32)
+     cat_features = None
+@@ -370,10 +430,15 @@ def _load_other_data(
+         idtype=torch.int32,
+     )
+ 
+-    masks_npz = np.load(path / f"split_{internal_split_name}.npz", allow_pickle=True)
+-    masks: dict[PartKey, np.ndarray] = {
+-        part: masks_npz[f"{part}_mask"] for part in DATA_PARTS
+-    }
++    if external_split_file is not None:
++        masks: dict[PartKey, np.ndarray] = dict(
++            np.load(path / external_split_file, allow_pickle=True)
++        )
++    else:
++        masks_npz = np.load(path / f"split_{internal_split_name}.npz", allow_pickle=True)
++        masks = {
++            part: masks_npz[f"{part}_mask"] for part in DATA_PARTS
++        }
+ 
+     _mask_labeled_nodes(labels, masks)
+ 
+@@ -395,8 +460,8 @@ def load_data(path: str | Path, **data_params) -> GraphData:
+     move binary categorical features to fraction features, if applicable.
+     """
+ 
+-    path = Path(path).resolve()
+-    name = path.name
++    path_in = Path(path)
++    name = path_in.name
+ 
+     if name in constants.GRAPHLAND_DATASETS:
+         _load_data_fn = _load_graphland_data
+@@ -405,7 +470,10 @@ def load_data(path: str | Path, **data_params) -> GraphData:
+         _load_data_fn = _load_pyg_data
+ 
+     elif name in constants.OGB_DATASETS:
+-        _load_data_fn = _load_ogb_data
++        npy = path_in.resolve() / "features.npy"
++        _load_data_fn = (
++            _load_other_data if npy.is_file() else _load_ogb_data
++        )
+ 
+     elif name in constants.OTHER_DATASETS:
+         _load_data_fn = _load_other_data
+@@ -413,7 +481,7 @@ def load_data(path: str | Path, **data_params) -> GraphData:
+     else:
+         raise ValueError(f"Unknown {name=}")
+ 
+-    data = _load_data_fn(path, **data_params)
++    data = _load_data_fn(path_in, **data_params)
+ 
+     cat_features = data["cat_features"]
+     if cat_features is not None:
+@@ -652,6 +720,8 @@ def impute_nans(
+     setting: str | Setting,
+     strategy: str = "most_frequent",
+ ) -> np.ndarray:
++    if features.shape[1] == 0:
++        return features
+     setting = Setting(setting)
+     assert setting == Setting.TRANSDUCTIVE
+ 
+@@ -678,6 +748,8 @@ def transform_num_features(
+     policy: None | str | NumPolicy,
+     seed: None | int,
+ ) -> np.ndarray:
++    if features.shape[1] == 0:
++        return features
+     if policy is None:
+         features = impute_nans(features, masks, setting)
+         return features
+diff --git a/lib/metrics.py b/lib/metrics.py
+index 1553ddb..35f8b22 100644
+--- a/lib/metrics.py
++++ b/lib/metrics.py
+@@ -62,7 +62,22 @@ def calculate_metrics(
+             sklearn.metrics.classification_report(y_true, labels, output_dict=True),
+         )
+         if probs is not None:
+-            result["cross-entropy"] = float(sklearn.metrics.log_loss(y_true, probs))
++            if task_type == TaskType.MULTICLASS and probs.ndim > 1:
++                class_labels = np.arange(probs.shape[-1])
++                result["cross-entropy"] = float(
++                    sklearn.metrics.log_loss(y_true, probs, labels=class_labels)
++                )
++                result["roc-auc"] = float(
++                    sklearn.metrics.roc_auc_score(
++                        y_true,
++                        probs,
++                        multi_class="ovr",
++                        average="macro",
++                        labels=class_labels,
++                    )
++                )
++            else:
++                result["cross-entropy"] = float(sklearn.metrics.log_loss(y_true, probs))
+         if task_type == TaskType.BINCLASS and probs is not None:
+             result["roc-auc"] = float(sklearn.metrics.roc_auc_score(y_true, probs))
+             result["ap"] = float(sklearn.metrics.average_precision_score(y_true, probs))

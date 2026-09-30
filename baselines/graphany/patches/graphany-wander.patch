@@ -1,0 +1,95 @@
+diff --git a/graphany/data.py b/graphany/data.py
+index 5821002..6801505 100644
+--- a/graphany/data.py
++++ b/graphany/data.py
+@@ -14,6 +14,7 @@ import pytorch_lightning as pl
+ import torch
+ from hydra.utils import instantiate
+ from omegaconf import OmegaConf
++from pathlib import Path
+ from scipy.spatial.distance import pdist, squareform
+ from sklearn.manifold._utils import (
+     _binary_search_perplexity as sklearn_binary_search_perplexity,
+@@ -148,6 +149,45 @@ def load_heterophilous_dataset(url, raw_dir):
+     return graph, labels, num_classes, node_features, train_masks, val_masks, test_masks
+ 
+ 
++def load_wander_bundle(bundle_dir, split_file="split.npz"):
++    """Load a Wander/GraphPFN-style npy bundle (features, targets, edgelist, split).
++
++    Empty ``features.npy`` (topology-only / nofeat) is replaced with a constant-1
++    column so LinearGNN channels still run. ``split_file`` selects a Wander
++    protocol split (``split.npz`` or ``split_{i}.npz``).
++    """
++    bundle_dir = Path(bundle_dir)
++    features = np.load(bundle_dir / "features.npy")
++    targets = np.load(bundle_dir / "targets.npy")
++    edgelist = np.load(bundle_dir / "edgelist.npy")
++    split_path = bundle_dir / split_file
++    if not split_path.is_file():
++        raise FileNotFoundError(f"Missing GraphAny split {split_path}")
++    split = np.load(split_path)
++    n_nodes = int(targets.shape[0])
++    if features.ndim != 2 or features.shape[1] == 0:
++        features = np.ones((n_nodes, 1), dtype=np.float32)
++    if edgelist.size == 0:
++        src = torch.zeros(0, dtype=torch.int64)
++        dst = torch.zeros(0, dtype=torch.int64)
++    else:
++        src = torch.as_tensor(edgelist[:, 0], dtype=torch.int64)
++        dst = torch.as_tensor(edgelist[:, 1], dtype=torch.int64)
++    g = dgl.graph((src, dst), num_nodes=n_nodes)
++    labels = torch.as_tensor(targets)
++    if labels.ndim > 1:
++        labels = labels.argmax(dim=-1)
++    labels = labels.long()
++    valid = labels >= 0
++    num_class = int(labels[valid].max().item()) + 1 if bool(valid.any()) else 1
++    labels = torch.where(labels < 0, torch.zeros_like(labels), labels)
++    feat = torch.as_tensor(features, dtype=torch.float32)
++    train_mask = torch.as_tensor(split["train"].astype(bool))
++    val_mask = torch.as_tensor(split["val"].astype(bool))
++    test_mask = torch.as_tensor(split["test"].astype(bool))
++    return g, labels, num_class, feat, train_mask, val_mask, test_mask
++
++
+ class CombinedDataset(pl.LightningDataModule):
+     def __init__(self, train_ds_dict, eval_ds_dict, cfg):
+         super().__init__()
+@@ -205,11 +245,24 @@ class GraphDataset(pl.LightningDataModule):
+ 
+         self.n_hops = n_hops
+ 
+-        self.data_source, ds_alias = cfg["_ds_meta_data"][ds_name].split(", ")
++        meta = cfg.get("_ds_meta_data", {}) or {}
++        if ds_name in meta:
++            self.data_source, ds_alias = str(meta[ds_name]).split(", ")
++        else:
++            self.data_source, ds_alias = "wander", ds_name
+         self.gidtype = None
+         self.dist = None
+         self.unmasked_pred = None
+-        if self.data_source == "pyg":
++        if self.data_source == "wander":
++            data_root = os.environ.get("GRAPHANY_DATA_ROOT") or cfg.get("wander_data_root")
++            if not data_root:
++                data_root = f"{cfg.dirs.data_storage}wander"
++            ds_init_args = {
++                "_target_": "graphany.data.load_wander_bundle",
++                "bundle_dir": str(Path(data_root) / ds_name),
++                "split_file": str(cfg.get("wander_split_file", "split.npz")),
++            }
++        elif self.data_source == "pyg":
+             components = ds_alias.split(".")
+             ds_init_args = {
+                 "_target_": f"torch_geometric.datasets.{ds_alias}",
+@@ -340,6 +393,9 @@ class GraphDataset(pl.LightningDataModule):
+             num_class = label.max().item() + 1
+ 
+             feat = g.ndata["feat"]
++        elif self.data_source == "wander":
++            g, label, num_class, feat, train_mask, val_mask, test_mask = dataset
++            self.split_index = int(self.cfg.get("wander_split_index", self.cfg.get("seed", 0)))
+         elif self.data_source == "heterophilous":
+             g, label, num_class, feat, train_mask, val_mask, test_mask = dataset
+         elif self.data_source == "dgl":

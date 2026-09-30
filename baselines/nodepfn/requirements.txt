@@ -1,0 +1,16 @@
+# nodepfn_env extras (install torch first from TORCH_INDEX_URL).
+torch_geometric>=2.4
+ConfigSpace==0.4.21
+gdown
+gpytorch>=1.11
+huggingface-hub
+networkx
+numpy
+ogb
+pandas
+scikit-learn
+scipy
+seaborn
+tensorboardX
+tqdm
+wandb

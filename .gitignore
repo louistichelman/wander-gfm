@@ -1,0 +1,26 @@
+.env
+checkpoints/
+logs/
+raw_data/
+results/
+wandb/
+notebooks/
+*/__pycache__/
+*.pyc
+
+# GraphPFN eval dumps next to generated TOML
+baselines/graphpfn/configs/**/evaluation/
+baselines/graphpfn/configs/**/tuning/
+*.toml
+
+# Third-party runtime artifacts (submodule gitlinks stay tracked)
+third_party/**/data/
+third_party/**/log/
+third_party/**/logs/
+third_party/**/Models/*.mod
+third_party/**/models_ckpts/
+third_party/**/__pycache__/
+third_party/**/exp/**/evaluation/
+third_party/**/exp/**/tuning/
+
+

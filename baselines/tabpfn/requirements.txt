@@ -1,0 +1,7 @@
+# tabpfn_env extras (install torch first from TORCH_INDEX_URL).
+tabpfn>=2.0
+pydantic-settings
+scikit-learn
+numpy
+pandas
+torch-geometric

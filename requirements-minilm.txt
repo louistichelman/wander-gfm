@@ -1,0 +1,3 @@
+# Optional extras for Table 6 MiniLM node-feature caches.
+# Install into the wander env:  python -m pip install -r requirements-minilm.txt
+sentence-transformers>=2.2.0

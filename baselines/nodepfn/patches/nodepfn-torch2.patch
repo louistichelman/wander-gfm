@@ -1,0 +1,208 @@
+diff --git a/nodepfn/layer.py b/nodepfn/layer.py
+index 7ca71f2..72532f4 100644
+--- a/nodepfn/layer.py
++++ b/nodepfn/layer.py
+@@ -1,13 +1,26 @@
+-from functools import partial
++import os
++from typing import Optional
+ 
+-from torch import nn
++from torch import nn, Tensor
+ import torch
+-from torch.nn.modules.transformer import _get_activation_fn, Module, Tensor, Optional, MultiheadAttention, Linear, Dropout, LayerNorm
+-from torch.utils.checkpoint import checkpoint
++from torch.nn import Dropout, LayerNorm, Linear, Module, MultiheadAttention
++from torch.nn.modules.transformer import _get_activation_fn
+ import torch_geometric.nn as pygnn
+ from torch_geometric.nn import Linear as Linear_pyg
+ import torch.nn.functional as F
+ 
++# Queries attend independently to shared train keys; chunking is exact and
++# avoids materializing an n_query × n_train attention matrix (NodePFN OOM).
++_DEFAULT_QUERY_ATTN_CHUNK = 4096
++
++
++def _query_attn_chunk_size() -> int:
++    raw = os.environ.get("NODEPFN_QUERY_ATTN_CHUNK", str(_DEFAULT_QUERY_ATTN_CHUNK))
++    try:
++        return max(1, int(raw))
++    except ValueError:
++        return _DEFAULT_QUERY_ATTN_CHUNK
++
+ 
+ class TransformerEncoderLayer(Module):
+     r"""TransformerEncoderLayer is made up of self-attn and feedforward network.
+@@ -195,6 +208,68 @@ class TransformerEncoderLayer(Module):
+             h = self.norm2(h)
+             
+         return h
++
++    def _attn_out(
++        self,
++        query: Tensor,
++        key: Tensor,
++        value: Tensor,
++        *,
++        attn_mask: Optional[Tensor] = None,
++        key_padding_mask: Optional[Tensor] = None,
++    ) -> Tensor:
++        return self.self_attn(
++            query,
++            key,
++            value,
++            attn_mask=attn_mask,
++            key_padding_mask=key_padding_mask,
++            need_weights=False,
++        )[0]
++
++    def _attn_chunked_query(
++        self,
++        query: Tensor,
++        key: Tensor,
++        value: Tensor,
++        *,
++        attn_mask: Optional[Tensor] = None,
++        key_padding_mask: Optional[Tensor] = None,
++    ) -> Tensor:
++        """MHA over query chunks. Equivalent because queries do not attend to each other."""
++        chunk = _query_attn_chunk_size()
++        n_q = int(query.shape[0])
++        if n_q <= chunk:
++            return self._attn_out(
++                query,
++                key,
++                value,
++                attn_mask=attn_mask,
++                key_padding_mask=key_padding_mask,
++            )
++        outs = []
++        for start in range(0, n_q, chunk):
++            stop = min(start + chunk, n_q)
++            mask_i = None
++            if attn_mask is not None:
++                if attn_mask.dim() == 2:
++                    mask_i = attn_mask[start:stop]
++                elif attn_mask.dim() == 3:
++                    mask_i = attn_mask[:, start:stop]
++                else:
++                    raise ValueError(
++                        f"unsupported attn_mask dim {attn_mask.dim()} for query chunking"
++                    )
++            outs.append(
++                self._attn_out(
++                    query[start:stop],
++                    key,
++                    value,
++                    attn_mask=mask_i,
++                    key_padding_mask=key_padding_mask,
++                )
++            )
++        return torch.cat(outs, dim=0)
+     
+     def _process_global_attention(self, src_: Tensor, src_mask: Optional[Tensor] = None, 
+                                   src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+@@ -214,25 +289,44 @@ class TransformerEncoderLayer(Module):
+             global_and_train_tokens_src = src_[:num_global_tokens+num_train_tokens]
+             eval_tokens_src = src_[num_global_tokens+num_train_tokens:]
+ 
+-            attn = partial(checkpoint, self.self_attn) if self.recompute_attn else self.self_attn
+-
+-            global_tokens_src2 = attn(global_tokens_src, global_and_train_tokens_src, global_and_train_tokens_src, None, True, global_src_mask)[0]
+-            train_tokens_src2 = attn(train_tokens_src, global_tokens_src, global_tokens_src, None, True, trainset_src_mask)[0]
+-            eval_tokens_src2 = attn(eval_tokens_src, src_, src_,
+-                                    None, True, valset_src_mask)[0]
++            global_tokens_src2 = self._attn_out(
++                global_tokens_src,
++                global_and_train_tokens_src,
++                global_and_train_tokens_src,
++                attn_mask=global_src_mask,
++            )
++            train_tokens_src2 = self._attn_out(
++                train_tokens_src,
++                global_tokens_src,
++                global_tokens_src,
++                attn_mask=trainset_src_mask,
++            )
++            eval_tokens_src2 = self._attn_chunked_query(
++                eval_tokens_src, src_, src_, attn_mask=valset_src_mask
++            )
+ 
+             src2 = torch.cat([global_tokens_src2, train_tokens_src2, eval_tokens_src2], dim=0)
+ 
+         elif isinstance(src_mask, int):
+             assert src_key_padding_mask is None
+             single_eval_position = src_mask
+-            src_left = self.self_attn(src_[:single_eval_position], src_[:single_eval_position], src_[:single_eval_position])[0]
+-            src_right = self.self_attn(src_[single_eval_position:], src_[:single_eval_position], src_[:single_eval_position])[0]
++            src_left = self._attn_out(
++                src_[:single_eval_position],
++                src_[:single_eval_position],
++                src_[:single_eval_position],
++            )
++            src_right = self._attn_chunked_query(
++                src_[single_eval_position:],
++                src_[:single_eval_position],
++                src_[:single_eval_position],
++            )
+             src2 = torch.cat([src_left, src_right], dim=0)
+         else:
+-            if self.recompute_attn:
+-                src2 = checkpoint(self.self_attn, src_, src_, src_, src_key_padding_mask, True, src_mask)[0]
+-            else:
+-                src2 = self.self_attn(src_, src_, src_, attn_mask=src_mask,
+-                                      key_padding_mask=src_key_padding_mask)[0]
++            src2 = self._attn_chunked_query(
++                src_,
++                src_,
++                src_,
++                attn_mask=src_mask,
++                key_padding_mask=src_key_padding_mask,
++            )
+         return src2
+diff --git a/nodepfn/scripts/model_builder.py b/nodepfn/scripts/model_builder.py
+index 2be40a5..f8e948e 100644
+--- a/nodepfn/scripts/model_builder.py
++++ b/nodepfn/scripts/model_builder.py
+@@ -37,7 +37,9 @@ def load_model_only_inference(path, filename, device):
+     cannot be used for further training.
+     """
+ 
+-    model_state, optimizer_state, config_sample = torch.load(os.path.join(path, filename), map_location='cpu')
++    model_state, optimizer_state, config_sample = torch.load(
++        os.path.join(path, filename), map_location='cpu', weights_only=False
++    )
+ 
+     if (('nan_prob_no_reason' in config_sample and config_sample['nan_prob_no_reason'] > 0.0) or
+         ('nan_prob_a_reason' in config_sample and config_sample['nan_prob_a_reason'] > 0.0) or
+@@ -84,7 +86,7 @@ def load_model(path, filename, device, eval_positions, verbose):
+     # print('Loading....')
+     print('!! Warning: GPyTorch must be installed !!')
+     model_state, optimizer_state, config_sample = torch.load(
+-        os.path.join(path, filename), map_location='cpu')
++        os.path.join(path, filename), map_location='cpu', weights_only=False)
+     if ('differentiable_hyperparameters' in config_sample
+             and 'prior_mlp_activations' in config_sample['differentiable_hyperparameters']):
+         config_sample['differentiable_hyperparameters']['prior_mlp_activations']['choice_values_used'] = config_sample[
+@@ -129,7 +131,7 @@ def fix_loaded_config_sample(loaded_config_sample, config):
+     copy_to_sample('differentiable_hyperparameters','prior_mlp_activations','choice_values')
+ 
+ def load_config_sample(path, template_config):
+-    model_state, optimizer_state, loaded_config_sample = torch.load(path, map_location='cpu')
++    model_state, optimizer_state, loaded_config_sample = torch.load(path, map_location='cpu', weights_only=False)
+     fix_loaded_config_sample(loaded_config_sample, template_config)
+     return loaded_config_sample
+ 
+diff --git a/nodepfn/scripts/transformer_prediction_interface.py b/nodepfn/scripts/transformer_prediction_interface.py
+index aa62d2d..b02e5a6 100644
+--- a/nodepfn/scripts/transformer_prediction_interface.py
++++ b/nodepfn/scripts/transformer_prediction_interface.py
+@@ -34,7 +34,7 @@ class CustomUnpickler(pickle.Unpickler):
+ 
+     def find_class_cpu(self, module, name):
+         if module == 'torch.storage' and name == '_load_from_bytes':
+-            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
++            return lambda b: torch.load(io.BytesIO(b), map_location='cpu', weights_only=False)
+         else:
+             return super().find_class(module, name)
+ 

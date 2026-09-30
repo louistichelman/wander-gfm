@@ -1,0 +1,15 @@
+[submodule "third_party/graphpfn"]
+	path = third_party/graphpfn
+	url = https://github.com/yandex-research/graphpfn.git
+[submodule "third_party/NodePFN"]
+	path = third_party/NodePFN
+	url = https://github.com/jeongwhanchoi/NodePFN.git
+[submodule "third_party/AnyGraph"]
+	path = third_party/AnyGraph
+	url = https://github.com/HKUDS/AnyGraph.git
+[submodule "third_party/GraphAny"]
+	path = third_party/GraphAny
+	url = https://github.com/DeepGraphLearning/GraphAny.git
+[submodule "third_party/context_LP"]
+	path = third_party/context_LP
+	url = https://github.com/Barcavin/context_LP.git

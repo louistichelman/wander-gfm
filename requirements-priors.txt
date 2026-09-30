@@ -1,0 +1,4 @@
+# Optional extras for --prior_config nodepfn and scripts/priors NodePFN metrics.
+# Install into the wander env:  python -m pip install -r requirements-priors.txt
+ConfigSpace>=0.4.21
+gpytorch>=1.11

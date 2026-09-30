@@ -1,0 +1,8 @@
+# unilp_env extras (install torch first from TORCH_INDEX_URL).
+torch-geometric>=2.4
+ogb
+networkx
+pyyaml
+tqdm
+scipy
+pandas

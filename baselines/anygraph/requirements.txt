@@ -1,0 +1,7 @@
+# anygraph_env extras (install torch first from TORCH_INDEX_URL).
+numpy
+scipy
+torch_geometric>=2.3,<2.5
+setproctitle
+scikit-learn
+pandas

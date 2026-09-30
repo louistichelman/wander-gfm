@@ -1,0 +1,30 @@
+# graphpfn_env extras (install torch first from TORCH_INDEX_URL).
+# Also install a DGL wheel that matches that torch/CUDA.
+delu==0.0.26
+loguru==0.7.3
+numpy>=1.26
+optuna==4.2.1
+PyYAML>=6.0
+rtdl-num-embeddings==0.0.11
+rtdl-revisiting-models==0.0.2
+scikit-learn>=1.4
+scipy>=1.13
+tensorboard>=2.14
+tomli-w>=1.0
+tqdm
+torch-geometric>=2.4
+ogb
+einops
+loralib==0.1.2
+lightgbm
+catboost
+xgboost
+huggingface-hub>=0.33.1
+pandas
+matplotlib
+networkx
+jinja2
+fsspec
+filelock
+sympy
+pillow
