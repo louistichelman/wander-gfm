@@ -317,6 +317,58 @@ def _install_train_free_filter(
     return orig
 
 
+class _WalkStatsRecorder:
+    """Per-node walk statistics for query-phase (Phase B) walks.
+
+    For every node v and layer t, counts how many sampled walks visit v
+    (``visits``) and how many of those walks also visit a labeled train node
+    (``visits_hit``). Counted over all batches, inference samples and batch
+    seeds of one cell; walks that visit v several times count once.
+    """
+
+    def __init__(self, n_nodes: int, n_layers: int, train_mask: Tensor) -> None:
+        self.n = int(n_nodes)
+        self.visits = np.zeros((n_layers, self.n), dtype=np.int64)
+        self.visits_hit = np.zeros((n_layers, self.n), dtype=np.int64)
+        self.train_mask = train_mask.to(torch.bool)
+
+    @torch.no_grad()
+    def add(self, walks: Tensor) -> None:
+        if walks.ndim != 4:
+            raise ValueError(f"expected walks [T, B, N, L], got {tuple(walks.shape)}")
+        tm = self.train_mask.to(walks.device)
+        n_layers = walks.shape[0]
+        flat = walks.reshape(n_layers, -1, walks.shape[-1])  # [T, W, L]
+        valid = (flat >= 0) & (flat < self.n)
+        hit = (tm[flat.clamp(min=0, max=self.n - 1)] & valid).any(dim=-1)  # [T, W]
+        idx = torch.where(valid, flat, torch.full_like(flat, self.n))  # padding -> spare column n
+        for t in range(min(n_layers, self.visits.shape[0])):
+            member = torch.zeros(flat.shape[1], self.n + 1, dtype=torch.bool, device=walks.device)
+            member.scatter_(1, idx[t], True)  # unique nodes per walk
+            member = member[:, : self.n]
+            self.visits[t] += member.sum(dim=0).cpu().numpy()
+            self.visits_hit[t] += (member & hit[t].unsqueeze(-1)).sum(dim=0).cpu().numpy()
+
+
+def _install_walk_recorder(model: Wander, recorder: _WalkStatsRecorder) -> Any:
+    orig = model.walks_node_classification
+
+    def wrapped(data, batch_indices, stay_on_cpu: bool = False, start_mode: str = "default", walk_focus_indices=None):
+        walk_tuple = orig(
+            data,
+            batch_indices,
+            stay_on_cpu=stay_on_cpu,
+            start_mode=start_mode,
+            walk_focus_indices=walk_focus_indices,
+        )
+        if start_mode == "batch_only":
+            recorder.add(walk_tuple[0])
+        return walk_tuple
+
+    model.walks_node_classification = wrapped
+    return orig
+
+
 def _mean_stats(rows: list[dict[str, float]]) -> dict[str, float]:
     if not rows:
         return {}
@@ -501,6 +553,11 @@ def main() -> None:
             "deterministic partition."
         ),
     )
+    parser.add_argument(
+        "--record_walk_stats",
+        action="store_true",
+        help="Also save per-node walk visit counts (all / train-hitting) per layer in maps.npz.",
+    )
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
@@ -660,6 +717,11 @@ def main() -> None:
         orig_walks = None
         if keep_p is not None:
             orig_walks = _install_train_free_filter(model, train_mask_t, float(keep_p), filter_stats)
+        recorder = None
+        orig_walks_rec = None
+        if args.record_walk_stats:
+            recorder = _WalkStatsRecorder(n_nodes, int(model.T), train_mask_t)
+            orig_walks_rec = _install_walk_recorder(model, recorder)  # records walks after filtering
 
         probs_sum = np.zeros((n_nodes, n_cls), dtype=np.float64)
         probs_n = np.zeros(n_nodes, dtype=np.float64)
@@ -680,6 +742,8 @@ def main() -> None:
             ok = np.isfinite(probs).all(axis=1)
             probs_sum[ok] += probs[ok]
             probs_n[ok] += 1.0
+        if orig_walks_rec is not None:
+            model.walks_node_classification = orig_walks_rec
         if orig_walks is not None:
             model.walks_node_classification = orig_walks
         model.attach_train_kv_cache(None)
@@ -740,6 +804,11 @@ def main() -> None:
             test_mask=test_mask,
             grid_id=grid_id,
             hops=hops,
+            **(
+                {"walk_visits": recorder.visits, "walk_visits_hit": recorder.visits_hit}
+                if recorder is not None
+                else {}
+            ),
         )
         (cell_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
         title = f"walk_num={walk_num}  walk_len={walk_len}"
