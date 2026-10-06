@@ -1,6 +1,6 @@
 # Wander
 
-Accompanying code for *To Learn is to Wander: Learning Across Graphs and Tasks with Random Walks*.
+Accompanying code for *[To Learn is to Wander: Learning Across Graphs and Tasks with Random Walks](https://arxiv.org/abs/2610.06694)*.
 
 A single pretrained checkpoint covers node classification, homogeneous link prediction, and knowledge-graph link prediction. Evaluation datasets are downloaded into `raw_data/` on first use.
 
